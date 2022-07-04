@@ -206,17 +206,16 @@ mod async_executor {
     use std::{
         pin::Pin,
         sync::mpsc::{channel, Receiver, Sender},
-        task::Context,
     };
 
     use futures::Future;
 
-    use crate::safe_waker::{WakeByIdx, WakerTraitExt};
+    use crate::no_heap_waker;
 
     type FutPointer<'tasks> = Pin<&'tasks mut dyn Future<Output = ()>>;
 
     pub struct Executor<'tasks> {
-        all_tasks: Vec<Option<FutPointer<'tasks>>>,
+        all_tasks: Vec<Option<(FutPointer<'tasks>, no_heap_waker::WakerData)>>,
         pollable_tasks: Receiver<usize>,
         task_sender: Sender<usize>,
     }
@@ -232,23 +231,24 @@ mod async_executor {
         }
 
         pub fn spawn(&mut self, fut: FutPointer<'tasks>) {
-            self.all_tasks.push(Some(fut));
+            self.all_tasks.push(Some((
+                fut,
+                no_heap_waker::WakerData {
+                    idx: self.all_tasks.len(),
+                    sender: self.task_sender.clone(),
+                },
+            )));
             self.task_sender
                 .send(self.all_tasks.len() - 1)
                 .expect("task_sender should never fail while the executor is alive")
         }
 
         pub fn step_once(&mut self) {
-            // true if we polled at least 1 future
             while let Ok(fut_idx) = self.pollable_tasks.try_recv() {
-                if let Some(fut_pointer) = &mut self.all_tasks[fut_idx] {
-                    // remember we polled at least one future
-                    let waker = WakeByIdx {
-                        idx: fut_idx,
-                        sender: self.task_sender.clone(),
-                    }
-                    .to_waker();
-                    let mut context = Context::from_waker(&waker);
+                if let Some((fut_pointer, waker_data)) = &mut self.all_tasks[fut_idx] {
+                    let waker = waker_data.to_waker();
+                    let mut context = waker.make_context();
+
                     match fut_pointer.as_mut().poll(&mut context) {
                         std::task::Poll::Ready(()) => self.all_tasks[fut_idx] = None,
                         std::task::Poll::Pending => {}
@@ -265,7 +265,7 @@ mod async_executor {
 
 mod reactor {
     use std::cell::RefCell;
-    use std::io;
+    use std::io::{self, ErrorKind};
     use std::task::Waker;
     use std::time::Duration;
 
@@ -292,6 +292,12 @@ mod reactor {
         pub async fn write(&mut self, to_write: &[u8]) -> io::Result<()> {
             TcpStreamWriteFut::new(self.reactor, self.socket_idx, to_write).await;
             Ok(())
+        }
+    }
+
+    impl Drop for AsyncSocket<'_> {
+        fn drop(&mut self) {
+            self.reactor.close_connection(self.socket_idx);
         }
     }
 
@@ -328,13 +334,6 @@ mod reactor {
             }
         }
 
-        pub fn use_socket(&self, socket_idx: usize) -> AsyncSocket {
-            AsyncSocket {
-                reactor: self,
-                socket_idx,
-            }
-        }
-
         pub fn tick(&self) {
             let mut events = Events::with_capacity(128);
             let sockets = self.sockets.borrow();
@@ -362,93 +361,72 @@ mod reactor {
             let sockets = self.sockets.borrow();
             let mut borrow = sockets[socket_idx].borrow_mut();
             if let Some(socket) = &mut *borrow {
-                socket
-                    .stream
-                    .shutdown(std::net::Shutdown::Both)
-                    .expect("why can't we shut down the socket?");
+                let result = socket.stream.shutdown(std::net::Shutdown::Both);
+                match &result {
+                    Ok(()) => (),
+                    Err(e) => match e.kind() {
+                        ErrorKind::NotConnected => (), // socket is already disconnected
+                        _ => result.expect("why can't we shut down the socket?"),
+                    },
+                }
             }
             *borrow = None;
         }
     }
 }
 
-mod safe_waker {
+mod no_heap_waker {
     use std::{
+        marker::PhantomData,
         sync::mpsc::Sender,
-        task::{RawWaker, RawWakerVTable, Waker},
+        task::{Context, RawWaker, RawWakerVTable, Waker},
     };
 
-    mod waker_trait {
-        use std::task::RawWakerVTable;
+    pub struct LifetimedWaker<'a> {
+        data_pointer_lifetime: PhantomData<&'a ()>,
+        waker: Waker,
+    }
 
-        pub trait WakerTrait: Clone {
-            const VTABLE_PTR: &'static RawWakerVTable;
-            fn wake(self) {
-                self.wake_by_ref()
-            }
-            fn wake_by_ref(&self);
-
-            fn to_pointer(self) -> *const () {
-                Box::into_raw(Box::new(self)) as *const _ as *const ()
+    impl<'a> LifetimedWaker<'a> {
+        fn new<T>(waker: RawWaker, _associated_lifetime: &'a T) -> Self {
+            Self {
+                data_pointer_lifetime: Default::default(),
+                waker: unsafe { Waker::from_raw(waker) },
             }
         }
-    }
-
-    pub trait WakerTraitExt: waker_trait::WakerTrait {
-        fn to_waker(self) -> Waker {
-            unsafe { Waker::from_raw(RawWaker::new(self.to_pointer(), Self::VTABLE_PTR)) }
+        pub fn make_context<'b>(&'b self) -> Context<'b> {
+            Context::from_waker(&self.waker)
         }
     }
-    impl<T: waker_trait::WakerTrait> WakerTraitExt for T {}
-
-    #[macro_export]
-    macro_rules! make_waker_vtable {
-        ($vtable_name:ident, $waker_ty:ty) => {
-            use $crate::safe_waker::waker_trait::WakerTrait;
-
-            #[allow(unused)]
-            const fn assert_implements_waker_trait<
-                T: $crate::safe_waker::waker_trait::WakerTrait,
-            >() {
-            }
-            const _: () = assert_implements_waker_trait::<$waker_ty>();
-
-            const $vtable_name: RawWakerVTable = RawWakerVTable::new(
-                |self_ptr| {
-                    let self_ref = unsafe { &*(self_ptr as *const $waker_ty) };
-                    let new = Box::new(self_ref.clone());
-                    let pointer = Box::into_raw(new) as *const _;
-                    RawWaker::new(pointer, &$vtable_name)
-                },
-                |self_ptr| {
-                    let self_box =
-                        unsafe { Box::from_raw(self_ptr as *const $waker_ty as *mut $waker_ty) };
-                    self_box.wake()
-                },
-                |self_ref| {
-                    let self_ref = unsafe { &*(self_ref as *const $waker_ty) };
-                    self_ref.wake_by_ref()
-                },
-                |self_ptr| {
-                    drop(unsafe { Box::from_raw(self_ptr as *const $waker_ty as *mut $waker_ty) })
-                },
-            );
-        };
-    }
-
-    make_waker_vtable!(WAKE_BY_IDX_VTABLE, WakeByIdx);
 
     #[derive(Clone)]
-    pub struct WakeByIdx {
+    pub struct WakerData {
         pub idx: usize,
         pub sender: Sender<usize>,
     }
 
-    impl waker_trait::WakerTrait for WakeByIdx {
-        const VTABLE_PTR: &'static RawWakerVTable = &WAKE_BY_IDX_VTABLE;
-
+    impl WakerData {
         fn wake_by_ref(&self) {
-            self.sender.send(self.idx).unwrap();
+            self.sender.send(self.idx).unwrap()
+        }
+        pub fn to_waker(&self) -> LifetimedWaker {
+            LifetimedWaker::new(
+                RawWaker::new(self as *const _ as *const (), &REF_WAKER_VTABLE),
+                self,
+            )
         }
     }
+
+    const REF_WAKER_VTABLE: RawWakerVTable = RawWakerVTable::new(
+        |self_ptr| {
+            // access through the same immutable reference
+            RawWaker::new(self_ptr, &REF_WAKER_VTABLE)
+        },
+        |self_ptr| unsafe { (&*(self_ptr as *const WakerData)).wake_by_ref() },
+        |self_ptr| unsafe { (&*(self_ptr as *const WakerData)).wake_by_ref() },
+        |_self_ptr| {
+            // no-op
+            // we don't own self pointer, so dropping shouldn't do anything
+        },
+    );
 }
