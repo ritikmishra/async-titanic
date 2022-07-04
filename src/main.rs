@@ -28,16 +28,12 @@ User-Agent: Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (
 ";
 
 fn main() {
-    let mut executor = Executor::new();
     let reactor = Reactor::new();
 
-    let sock1 = TcpStream::connect("54.208.105.16:80".parse().unwrap()).unwrap();
-    let sock2 = TcpStream::connect("54.208.105.16:80".parse().unwrap()).unwrap();
-
-    let mut sock1 = reactor.register_new_socket(sock1);
-    let mut sock2 = reactor.register_new_socket(sock2);
-
     let fut1 = async {
+        let sock1 = TcpStream::connect("54.208.105.16:80".parse().unwrap()).unwrap();
+        let mut sock1 = reactor.register_new_socket(sock1);
+
         println!("sending data (fut 1)");
         sock1.write(REQUEST_CONTENT_1S.as_bytes()).await.unwrap();
         println!("sent data (fut 1)");
@@ -50,6 +46,9 @@ fn main() {
     };
 
     let fut2 = async {
+        let sock2 = TcpStream::connect("54.208.105.16:80".parse().unwrap()).unwrap();
+        let mut sock2 = reactor.register_new_socket(sock2);
+
         println!("sending data (fut 2)");
         sock2.write(REQUEST_CONTENT_4S.as_bytes()).await.unwrap();
         println!("sent data (fut 2)");
@@ -63,8 +62,7 @@ fn main() {
 
     pin_mut!(fut1, fut2);
 
-    executor.spawn(fut1);
-    executor.spawn(fut2);
+    let mut executor = Executor::new_with_tasks([fut1, fut2]);
     loop {
         executor.step_once();
         reactor.tick();
@@ -205,7 +203,7 @@ mod socket_stream {
 mod async_executor {
     use std::{
         pin::Pin,
-        sync::mpsc::{channel, Receiver, Sender},
+        sync::mpsc::{channel, Receiver},
     };
 
     use futures::Future;
@@ -214,33 +212,40 @@ mod async_executor {
 
     type FutPointer<'tasks> = Pin<&'tasks mut dyn Future<Output = ()>>;
 
-    pub struct Executor<'tasks> {
-        all_tasks: Vec<Option<(FutPointer<'tasks>, no_heap_waker::WakerData)>>,
+    pub struct Executor<'tasks, const NUM_TASKS: usize> {
+        all_tasks: [Option<(FutPointer<'tasks>, no_heap_waker::WakerData)>; NUM_TASKS],
         pollable_tasks: Receiver<usize>,
-        task_sender: Sender<usize>,
+        // task_sender: Sender<usize>,
     }
 
-    impl<'tasks> Executor<'tasks> {
-        pub fn new() -> Self {
+    impl<'tasks, const NUM_TASKS: usize> Executor<'tasks, NUM_TASKS> {
+        pub fn new_with_tasks(tasks: [FutPointer<'tasks>; NUM_TASKS]) -> Self {
             let (sender, receiver) = channel();
-            Self {
-                all_tasks: Vec::new(),
-                pollable_tasks: receiver,
-                task_sender: sender,
+            // schedule all tasks to be executed initially
+            for i in 0..NUM_TASKS {
+                // SAFETY: this should never fail because the receiver is still in scope
+                sender.send(i).unwrap();
             }
-        }
 
-        pub fn spawn(&mut self, fut: FutPointer<'tasks>) {
-            self.all_tasks.push(Some((
-                fut,
-                no_heap_waker::WakerData {
-                    idx: self.all_tasks.len(),
-                    sender: self.task_sender.clone(),
-                },
-            )));
-            self.task_sender
-                .send(self.all_tasks.len() - 1)
-                .expect("task_sender should never fail while the executor is alive")
+            // add some state around the futures
+            let mut idx = 0;
+            let all_tasks = tasks.map(|task| {
+                let this_idx = idx;
+                idx += 1;
+                Some((
+                    task,
+                    no_heap_waker::WakerData {
+                        idx: this_idx,
+                        sender: sender.clone(),
+                    },
+                ))
+            });
+
+            Self {
+                all_tasks,
+                pollable_tasks: receiver,
+                // task_sender: sender,
+            }
         }
 
         pub fn step_once(&mut self) {
@@ -343,7 +348,6 @@ mod reactor {
             for event in &events {
                 // find the socket we got an event for, and wake up that future
                 let Token(socket_idx) = event.token();
-                println!("received event for {} ({:?})", socket_idx, event);
                 if let Some(waker) = sockets[socket_idx]
                     .borrow_mut()
                     .as_mut()
@@ -351,7 +355,6 @@ mod reactor {
                     .waker
                     .take()
                 {
-                    println!("waking");
                     waker.wake()
                 }
             }
@@ -382,6 +385,7 @@ mod no_heap_waker {
         task::{Context, RawWaker, RawWakerVTable, Waker},
     };
 
+    /// Represents a [Waker] where the data pointer in the [RawWaker] is actually a `&'a T`
     pub struct LifetimedWaker<'a> {
         data_pointer_lifetime: PhantomData<&'a ()>,
         waker: Waker,
@@ -409,6 +413,8 @@ mod no_heap_waker {
         fn wake_by_ref(&self) {
             self.sender.send(self.idx).unwrap()
         }
+
+        /// Make a waker that refers to the data at this location
         pub fn to_waker(&self) -> LifetimedWaker {
             LifetimedWaker::new(
                 RawWaker::new(self as *const _ as *const (), &REF_WAKER_VTABLE),
