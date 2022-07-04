@@ -146,7 +146,7 @@ mod socket_stream {
     }
 
     impl<'a> Future for TcpStreamWriteFut<'a, '_> {
-        type Output = ();
+        type Output = io::Result<()>;
 
         fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
             // unwrap because they shouldn't close our socket
@@ -159,15 +159,9 @@ mod socket_stream {
             match read_result {
                 // ready -> yield data
                 Ok(bytes_written) => {
-                    println!(
-                        "wrote {} more bytes ({} bytes so far, {} to write total)",
-                        bytes_written,
-                        self.bytes_written,
-                        self.data.len()
-                    );
                     self.bytes_written += bytes_written;
                     if self.bytes_written == self.data.len() {
-                        Poll::Ready(())
+                        Poll::Ready(Ok(()))
                     } else {
                         Poll::Pending
                     }
@@ -184,20 +178,11 @@ mod socket_stream {
                     // | ErrorKind::ConnectionRefused
                     // | ErrorKind::ConnectionReset
                     // | ErrorKind::NotConnected => Poll::Ready(()),
-                    _ => {
-                        panic!("encountered unknown error: {:?}", e)
-                    }
+                    _ => Poll::Ready(Err(e)),
                 },
             }
         }
     }
-
-    // impl<'a> Drop for TcpStreamFut<'a> {
-    //     fn drop(&mut self) {
-    //         // close the socket that we are associated to
-    //         self.reactor.close_connection(self.socket_idx)
-    //     }
-    // }
 }
 
 mod async_executor {
@@ -295,8 +280,7 @@ mod reactor {
         }
 
         pub async fn write(&mut self, to_write: &[u8]) -> io::Result<()> {
-            TcpStreamWriteFut::new(self.reactor, self.socket_idx, to_write).await;
-            Ok(())
+            TcpStreamWriteFut::new(self.reactor, self.socket_idx, to_write).await
         }
     }
 
@@ -386,6 +370,8 @@ mod no_heap_waker {
     };
 
     /// Represents a [Waker] where the data pointer in the [RawWaker] is actually a `&'a T`
+    ///
+    /// Since [Waker]/[RawWaker] don't have lifetimes, we put the lifetime on this wrapper struct
     pub struct LifetimedWaker<'a> {
         data_pointer_lifetime: PhantomData<&'a ()>,
         waker: Waker,
