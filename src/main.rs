@@ -1,9 +1,7 @@
 use async_executor::Executor;
-use futures::{pin_mut, StreamExt};
+use futures::pin_mut;
 use mio::net::TcpStream;
 use reactor::Reactor;
-
-use crate::socket_stream::{TcpStreamReadFut, TcpStreamWriteFut};
 
 const REQUEST_CONTENT_1S: &'static str = "GET /delay/1 HTTP/1.1
 Accept: text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.9
@@ -31,40 +29,36 @@ User-Agent: Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (
 
 fn main() {
     let mut executor = Executor::new();
-    let mut reactor = Reactor::new();
+    let reactor = Reactor::new();
 
     let sock1 = TcpStream::connect("54.208.105.16:80".parse().unwrap()).unwrap();
-    let sock_id1 = reactor.register_new_socket(sock1);
-
     let sock2 = TcpStream::connect("54.208.105.16:80".parse().unwrap()).unwrap();
-    let sock_id2 = reactor.register_new_socket(sock2);
+
+    let mut sock1 = reactor.register_new_socket(sock1);
+    let mut sock2 = reactor.register_new_socket(sock2);
 
     let fut1 = async {
-        // hi
-        println!("sending data");
-        TcpStreamWriteFut::new(&reactor, sock_id1, REQUEST_CONTENT_1S.as_bytes()).await;
-        println!("sent data");
+        println!("sending data (fut 1)");
+        sock1.write(REQUEST_CONTENT_1S.as_bytes()).await.unwrap();
+        println!("sent data (fut 1)");
 
-        println!("recieving data");
-        while let Some(data) = TcpStreamReadFut::new(&reactor, sock_id1).next().await {
-            print!("{}", String::from_utf8_lossy(&data));
-        }
+        println!("recieving data (fut 1)");
+        let data = sock1.read().await.unwrap();
+        print!("{}", String::from_utf8_lossy(&data));
 
-        println!("all done!");
+        println!("all done! (fut 1)");
     };
 
     let fut2 = async {
-        // hi
-        println!("sending data");
-        TcpStreamWriteFut::new(&reactor, sock_id2, REQUEST_CONTENT_4S.as_bytes()).await;
-        println!("sent data");
+        println!("sending data (fut 2)");
+        sock2.write(REQUEST_CONTENT_4S.as_bytes()).await.unwrap();
+        println!("sent data (fut 2)");
 
-        println!("recieving data");
-        while let Some(data) = TcpStreamReadFut::new(&reactor, sock_id2).next().await {
-            print!("{}", String::from_utf8_lossy(&data));
-        }
+        println!("recieving data (fut 2)");
+        let data = sock2.read().await.unwrap();
+        print!("{}", String::from_utf8_lossy(&data));
 
-        println!("all done!");
+        println!("all done! (fut 2)");
     };
 
     pin_mut!(fut1, fut2);
@@ -82,12 +76,12 @@ fn main() {
 
 mod socket_stream {
     use std::{
-        io::{ErrorKind, Read, Write},
+        io::{self, ErrorKind, Read, Write},
         pin::Pin,
         task::{Context, Poll},
     };
 
-    use futures::{stream::Stream, Future};
+    use futures::Future;
 
     use crate::reactor;
 
@@ -105,51 +99,33 @@ mod socket_stream {
         }
     }
 
-    impl<'a> Stream for TcpStreamReadFut<'a> {
-        type Item = Vec<u8>;
+    impl<'a> Future for TcpStreamReadFut<'a> {
+        type Output = io::Result<Vec<u8>>;
 
-        fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-            // unwrap because they shouldn't close our socket
-            let mut borrow_mut = self.reactor.sockets[self.socket_idx].borrow_mut();
+        fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+            let sockets = self.reactor.sockets.borrow();
+            let mut borrow_mut = sockets[self.socket_idx].borrow_mut();
             let mut socket = borrow_mut.as_mut().unwrap();
+
             let mut buf = Vec::new();
             let read_result = socket.stream.read_to_end(&mut buf);
 
-            socket.waker = Some(cx.waker().clone());
-
-            // poll socket
-            match read_result {
-                Ok(0) => {
-                    socket.waker = None;
-                    Poll::Ready(None)
+            let ret = {
+                match read_result {
+                    Ok(_) => Poll::Ready(Ok(buf)),
+                    Err(e) => match e.kind() {
+                        ErrorKind::WouldBlock if buf.len() > 0 => Poll::Ready(Ok(buf)),
+                        ErrorKind::NotConnected | ErrorKind::WouldBlock => Poll::Pending,
+                        _ => Poll::Ready(Err(e)),
+                    },
                 }
-                // ready -> yield data
-                Ok(_) => Poll::Ready(Some(buf)),
-                Err(e) => match e.kind() {
-                    // not ready -> place on queue
-                    ErrorKind::WouldBlock => {
-                        // remember to wake us when the future is ready
-                        println!("hopefully someone wakes me up");
+            };
 
-                        if buf.len() > 0 {
-                            Poll::Ready(Some(buf))
-                        } else {
-                            Poll::Pending
-                        }
-                    }
-                    ErrorKind::BrokenPipe
-                    | ErrorKind::ConnectionAborted
-                    | ErrorKind::ConnectionRefused
-                    | ErrorKind::ConnectionReset
-                    | ErrorKind::NotConnected => {
-                        socket.waker = None;
-                        Poll::Ready(None)
-                    }
-                    _ => {
-                        panic!("encountered unknown error: {:?}", e)
-                    }
-                },
+            if matches!(ret, Poll::Pending) {
+                socket.waker = Some(cx.waker().clone());
             }
+
+            ret
         }
     }
 
@@ -176,7 +152,8 @@ mod socket_stream {
 
         fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
             // unwrap because they shouldn't close our socket
-            let mut borrow_mut = self.reactor.sockets[self.socket_idx].borrow_mut();
+            let sockets = self.reactor.sockets.borrow();
+            let mut borrow_mut = sockets[self.socket_idx].borrow_mut();
             let mut socket = borrow_mut.as_mut().unwrap();
             let read_result = socket.stream.write(&self.data[self.bytes_written..]);
 
@@ -288,32 +265,52 @@ mod async_executor {
 
 mod reactor {
     use std::cell::RefCell;
+    use std::io;
     use std::task::Waker;
     use std::time::Duration;
 
     use mio::net::TcpStream;
     use mio::{Events, Interest, Poll, Token};
 
+    use crate::socket_stream::{TcpStreamReadFut, TcpStreamWriteFut};
+
     pub struct TcpStreamWrapper {
         pub stream: TcpStream,
         pub waker: Option<Waker>,
     }
 
+    pub struct AsyncSocket<'a> {
+        reactor: &'a Reactor,
+        socket_idx: usize,
+    }
+
+    impl AsyncSocket<'_> {
+        pub async fn read(&mut self) -> io::Result<Vec<u8>> {
+            TcpStreamReadFut::new(self.reactor, self.socket_idx).await
+        }
+
+        pub async fn write(&mut self, to_write: &[u8]) -> io::Result<()> {
+            TcpStreamWriteFut::new(self.reactor, self.socket_idx, to_write).await;
+            Ok(())
+        }
+    }
+
     pub struct Reactor {
         poll: RefCell<Poll>,
-        pub sockets: Vec<RefCell<Option<TcpStreamWrapper>>>,
+        pub sockets: RefCell<Vec<RefCell<Option<TcpStreamWrapper>>>>,
     }
     impl Reactor {
         pub fn new() -> Self {
             Self {
                 poll: Poll::new().unwrap().into(),
-                sockets: Vec::new(),
+                sockets: Vec::new().into(),
             }
         }
 
-        pub fn register_new_socket(&mut self, mut socket: TcpStream) -> usize {
-            let new_socket_idx = self.sockets.len();
+        pub fn register_new_socket(&self, mut socket: TcpStream) -> AsyncSocket {
+            let mut sockets = self.sockets.borrow_mut();
             let poll = self.poll.borrow_mut();
+            let new_socket_idx = sockets.len();
             poll.registry()
                 .register(
                     &mut socket,
@@ -321,14 +318,26 @@ mod reactor {
                     Interest::READABLE | Interest::WRITABLE,
                 )
                 .unwrap();
-            self.sockets.push(RefCell::new(Some(TcpStreamWrapper {
+            sockets.push(RefCell::new(Some(TcpStreamWrapper {
                 stream: socket,
                 waker: None,
             })));
-            new_socket_idx
+            AsyncSocket {
+                reactor: self,
+                socket_idx: new_socket_idx,
+            }
         }
+
+        pub fn use_socket(&self, socket_idx: usize) -> AsyncSocket {
+            AsyncSocket {
+                reactor: self,
+                socket_idx,
+            }
+        }
+
         pub fn tick(&self) {
             let mut events = Events::with_capacity(128);
+            let sockets = self.sockets.borrow();
             let mut poll = self.poll.borrow_mut();
             poll.poll(&mut events, Some(Duration::from_millis(1)))
                 .unwrap();
@@ -336,7 +345,7 @@ mod reactor {
                 // find the socket we got an event for, and wake up that future
                 let Token(socket_idx) = event.token();
                 println!("received event for {} ({:?})", socket_idx, event);
-                if let Some(waker) = self.sockets[socket_idx]
+                if let Some(waker) = sockets[socket_idx]
                     .borrow_mut()
                     .as_mut()
                     .expect("got event on a socket that we don't own??")
@@ -350,7 +359,8 @@ mod reactor {
         }
 
         pub fn close_connection(&self, socket_idx: usize) {
-            let mut borrow = self.sockets[socket_idx].borrow_mut();
+            let sockets = self.sockets.borrow();
+            let mut borrow = sockets[socket_idx].borrow_mut();
             if let Some(socket) = &mut *borrow {
                 socket
                     .stream
