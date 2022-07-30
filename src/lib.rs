@@ -1,3 +1,5 @@
+pub mod static_fut_storage;
+
 pub mod socket_stream {
     use std::{
         io::{self, ErrorKind, Read, Write},
