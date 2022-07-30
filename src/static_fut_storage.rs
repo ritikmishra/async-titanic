@@ -37,28 +37,6 @@ impl<const SIZE: usize> DerefMut for AlignedBuffer<SIZE> {
     }
 }
 
-// 1. store them statically
-pub const fn store_futs_statically<FutTuple, const SIZE: usize>(
-    __type_inference_hack: ManuallyDrop<Option<FutTuple>>,
-) -> AlignedBuffer<SIZE> {
-    // Verify that the buffer is big enough to store our futures
-    {
-        let size = core::mem::size_of::<FutTuple>();
-        let futs_alignment = core::mem::align_of::<FutTuple>();
-        assert!(
-            SIZE >= size,
-            "not enough bytes in the buffer to store the futures"
-        );
-        assert!(
-            core::mem::align_of::<AlignedBuffer<SIZE>>() >= futs_alignment,
-            "aligned buffer has insufficient alignment to hold the futures"
-        );
-    }
-    AlignedBuffer::zeroed()
-}
-
-// 2. from the static allocation, produce some Pin<&mut dyn Future<Output = ()>>
-
 macro_rules! count_idents {
     () => { 0 };
     ($x:ident) => { 1 };
@@ -141,6 +119,25 @@ macro_rules! dont_use_val {
             unreachable!()
         }
     };
+}
+
+pub const fn store_futs_statically<FutTuple, const SIZE: usize>(
+    __type_inference_hack: ManuallyDrop<Option<FutTuple>>,
+) -> AlignedBuffer<SIZE> {
+    // Verify that the buffer is big enough to store our futures
+    {
+        let size = core::mem::size_of::<FutTuple>();
+        let futs_alignment = core::mem::align_of::<FutTuple>();
+        assert!(
+            SIZE >= size,
+            "not enough bytes in the buffer to store the futures"
+        );
+        assert!(
+            core::mem::align_of::<AlignedBuffer<SIZE>>() >= futs_alignment,
+            "aligned buffer has insufficient alignment to hold the futures"
+        );
+    }
+    AlignedBuffer::zeroed()
 }
 
 #[macro_export]

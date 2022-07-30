@@ -1,11 +1,11 @@
 pub mod static_fut_storage;
 
 pub mod socket_stream {
-    use std::{
-        io::{self, ErrorKind, Read, Write},
+    use core::{
         pin::Pin,
         task::{Context, Poll},
     };
+    use std::io::{self, ErrorKind, Read, Write};
 
     use futures::Future;
 
@@ -114,10 +114,8 @@ pub mod socket_stream {
 }
 
 pub mod async_executor {
-    use std::{
-        pin::Pin,
-        sync::mpsc::{channel, Receiver},
-    };
+    use core::pin::Pin;
+    use std::sync::mpsc::{channel, Receiver};
 
     use futures::Future;
 
@@ -168,8 +166,8 @@ pub mod async_executor {
                     let mut context = waker.make_context();
 
                     match fut_pointer.as_mut().poll(&mut context) {
-                        std::task::Poll::Ready(()) => self.all_tasks[fut_idx] = None,
-                        std::task::Poll::Pending => {}
+                        core::task::Poll::Ready(()) => self.all_tasks[fut_idx] = None,
+                        core::task::Poll::Pending => {}
                     }
                 }
             }
@@ -182,10 +180,8 @@ pub mod async_executor {
 }
 
 pub mod reactor {
-    use std::cell::RefCell;
+    use core::{cell::RefCell, task::Waker, time::Duration};
     use std::io::{self, ErrorKind};
-    use std::task::Waker;
-    use std::time::Duration;
 
     use mio::net::TcpStream;
     use mio::{Events, Interest, Poll, Token};
@@ -291,11 +287,11 @@ pub mod reactor {
 }
 
 mod no_heap_waker {
-    use std::{
+    use core::{
         marker::PhantomData,
-        sync::mpsc::Sender,
         task::{Context, RawWaker, RawWakerVTable, Waker},
     };
+    use std::sync::mpsc::Sender;
 
     /// Represents a [Waker] where the data pointer in the [RawWaker] is actually a `&'a T`
     ///
