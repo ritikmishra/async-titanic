@@ -38,17 +38,13 @@ impl<const SIZE: usize> DerefMut for AlignedBuffer<SIZE> {
 }
 
 // 1. store them statically
-
-union Helper<Inner, const SIZE: usize> {
-    inner: ManuallyDrop<MaybeUninit<Inner>>,
-    buffer: AlignedBuffer<SIZE>,
-}
-pub const fn store_futs_statically<F1, F2, const SIZE: usize>(
-    __type_inference_hack: ManuallyDrop<Option<(F1, F2)>>,
+pub const fn store_futs_statically<FutTuple, const SIZE: usize>(
+    __type_inference_hack: ManuallyDrop<Option<FutTuple>>,
 ) -> AlignedBuffer<SIZE> {
+    // Verify that the buffer is big enough to store our futures
     {
-        let size = core::mem::size_of::<(F1, F2)>();
-        let futs_alignment = core::mem::align_of::<(F1, F2)>();
+        let size = core::mem::size_of::<FutTuple>();
+        let futs_alignment = core::mem::align_of::<FutTuple>();
         assert!(
             SIZE >= size,
             "not enough bytes in the buffer to store the futures"
@@ -58,29 +54,63 @@ pub const fn store_futs_statically<F1, F2, const SIZE: usize>(
             "aligned buffer has insufficient alignment to hold the futures"
         );
     }
-
-    unsafe {
-        let ret: Helper<(F1, F2), SIZE> = Helper {
-            buffer: (AlignedBuffer::zeroed()),
-        };
-
-        ret.buffer
-    }
+    AlignedBuffer::zeroed()
 }
 
 // 2. from the static allocation, produce some Pin<&mut dyn Future<Output = ()>>
 
-pub fn get_pin_muts<
-    F1: Future<Output = ()> + 'static,
-    F2: Future<Output = ()> + 'static,
-    const SIZE: usize,
->(
-    futs: (F1, F2),
-    aa: &'static mut AlignedBuffer<SIZE>,
-) -> [Pin<&'static mut dyn Future<Output = ()>>; 2] {
+macro_rules! count_idents {
+    () => { 0 };
+    ($x:ident) => { 1 };
+    ($x:ident, $($xs:ident),*) => {
+        1 + count_idents!($($xs),*)
+    }
+}
+
+macro_rules! impl_unit_fut_tuple {
+    ($($generic_ident:ident),*) => {
+        impl<$($generic_ident: Future<Output = ()> + 'static),*> UnitFutTuple<{ count_idents!($($generic_ident),*)}> for ($($generic_ident,)*) {
+            #[allow(non_snake_case)]
+            fn tuple_to_pin_array(
+                tuple: &'static mut Self,
+            ) -> [Pin<&'static mut dyn Future<Output = ()>>; { count_idents!($($generic_ident),*)}] {
+                let ($(ref mut $generic_ident,)*) = tuple;
+                unsafe {
+                    [
+                        $(Pin::new_unchecked($generic_ident),)*
+                    ]
+                }
+            }
+        }
+    };
+}
+
+pub trait UnitFutTuple<const NUM_ELEMENTS: usize>: 'static {
+    fn tuple_to_pin_array(
+        tuple: &'static mut Self,
+    ) -> [Pin<&'static mut dyn Future<Output = ()>>; NUM_ELEMENTS];
+}
+
+impl_unit_fut_tuple!(F1);
+impl_unit_fut_tuple!(F1, F2);
+impl_unit_fut_tuple!(F1, F2, F3);
+impl_unit_fut_tuple!(F1, F2, F3, F4);
+impl_unit_fut_tuple!(F1, F2, F3, F4, F5);
+impl_unit_fut_tuple!(F1, F2, F3, F4, F5, F6);
+impl_unit_fut_tuple!(F1, F2, F3, F4, F5, F6, F7);
+impl_unit_fut_tuple!(F1, F2, F3, F4, F5, F6, F7, F8);
+impl_unit_fut_tuple!(F1, F2, F3, F4, F5, F6, F7, F8, F9);
+impl_unit_fut_tuple!(F1, F2, F3, F4, F5, F6, F7, F8, F9, F10);
+impl_unit_fut_tuple!(F1, F2, F3, F4, F5, F6, F7, F8, F9, F10, F11);
+impl_unit_fut_tuple!(F1, F2, F3, F4, F5, F6, F7, F8, F9, F10, F11, F12);
+
+pub fn get_pin_muts<FutTuple: UnitFutTuple<NUM_FUTS>, const NUM_FUTS: usize, const SIZE: usize>(
+    futs: FutTuple,
+    buffer_to_insert_futs: &'static mut AlignedBuffer<SIZE>,
+) -> [Pin<&'static mut dyn Future<Output = ()>>; NUM_FUTS] {
     {
-        let size = core::mem::size_of::<(F1, F2)>();
-        let futs_alignment = core::mem::align_of::<(F1, F2)>();
+        let size = core::mem::size_of::<FutTuple>();
+        let futs_alignment = core::mem::align_of::<FutTuple>();
         assert!(
             SIZE >= size,
             "not enough bytes in the buffer to store the futures"
@@ -90,17 +120,17 @@ pub fn get_pin_muts<
             "aligned buffer has insufficient alignment to hold the futures"
         );
     }
-    let banana: &'static mut (F1, F2) = unsafe {
-        let banana: &'static mut Helper<_, SIZE> = &mut *aa.as_mut_ptr().cast::<Helper<_, SIZE>>();
+    let futs: &'static mut FutTuple = unsafe {
+        union Helper<Inner, const SIZE: usize> {
+            inner: ManuallyDrop<MaybeUninit<Inner>>,
+            _buffer: AlignedBuffer<SIZE>,
+        }
+        let banana: &'static mut Helper<_, SIZE> =
+            &mut *buffer_to_insert_futs.as_mut_ptr().cast::<Helper<_, SIZE>>();
         banana.inner.write(futs)
     };
 
-    unsafe {
-        [
-            Pin::new_unchecked(&mut banana.0),
-            Pin::new_unchecked(&mut banana.1),
-        ]
-    }
+    FutTuple::tuple_to_pin_array(futs)
 }
 
 #[macro_export]

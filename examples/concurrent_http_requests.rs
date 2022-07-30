@@ -47,12 +47,21 @@ async fn send_data(data: &'static str, reactor: &'static Reactor, i: i32) {
 }
 
 fn main() {
-    static mut REACTOR: Option<Reactor> = None;
-    let reactor: &'static Reactor = unsafe { REACTOR.insert(Reactor::new()) };
+    // SAFETY: This is the only mutable borrow of `REACTOR` that exists, or that
+    // can ever exist (since it is inside the block)
+    let reactor: &'static Reactor = unsafe {
+        static mut REACTOR: Option<Reactor> = None;
+        REACTOR.insert(Reactor::new())
+    };
 
-    let [fut1, fut2] = store_futs_statically!(300; send_data(REQUEST_CONTENT_1S, reactor, 1), send_data(REQUEST_CONTENT_4S, reactor, 2));
+    let futs = store_futs_statically!(
+        600;
+        send_data(REQUEST_CONTENT_1S, reactor, 1),
+        send_data(REQUEST_CONTENT_4S, reactor, 2),
+        send_data(REQUEST_CONTENT_4S, reactor, 3)
+    );
 
-    let mut executor = Executor::new_with_tasks([fut1, fut2]);
+    let mut executor = Executor::new_with_tasks(futs);
     loop {
         executor.step_once();
         reactor.tick();
