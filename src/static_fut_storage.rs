@@ -15,7 +15,7 @@ pub struct AlignedBuffer<const SIZE: usize> {
 }
 
 impl<const SIZE: usize> AlignedBuffer<SIZE> {
-    const fn zeroed() -> Self {
+    pub const fn zeroed() -> Self {
         Self {
             _ensure_alignment: A64,
             inner: [0; SIZE],
@@ -112,54 +112,14 @@ pub fn get_pin_muts<FutTuple: UnitFutTuple<NUM_FUTS>, const NUM_FUTS: usize, con
 }
 
 #[macro_export]
-macro_rules! dont_use_val {
-    ($anything:tt) => {
-        #[allow(unreachable_code)]
-        {
-            unreachable!()
-        }
-    };
-}
-
-pub const fn store_futs_statically<FutTuple, const SIZE: usize>(
-    __type_inference_hack: ManuallyDrop<Option<FutTuple>>,
-) -> AlignedBuffer<SIZE> {
-    // Verify that the buffer is big enough to store our futures
-    {
-        let size = core::mem::size_of::<FutTuple>();
-        let futs_alignment = core::mem::align_of::<FutTuple>();
-        assert!(
-            SIZE >= size,
-            "not enough bytes in the buffer to store the futures"
-        );
-        assert!(
-            core::mem::align_of::<AlignedBuffer<SIZE>>() >= futs_alignment,
-            "aligned buffer has insufficient alignment to hold the futures"
-        );
-    }
-    AlignedBuffer::zeroed()
-}
-
-#[macro_export]
 macro_rules! store_futs_statically {
     ($storage_size:expr; $(
         $async_fun:ident($($param:tt),*)
     ),*) => {{
-        use $crate::static_fut_storage::{AlignedBuffer, store_futs_statically, get_pin_muts};
+        use $crate::static_fut_storage::{AlignedBuffer, get_pin_muts};
         use ::core::mem::ManuallyDrop;
 
-        static mut FUT_STORAGE: AlignedBuffer<{ $storage_size }> = store_futs_statically({
-            ManuallyDrop::new(if true {
-                None
-            } else {
-                // stupid type inference hack lol
-                Some(
-                    ($(
-                        $async_fun($($crate::dont_use_val!($param)),*)
-                    ),*)
-                )
-            })
-        });
+        static mut FUT_STORAGE: AlignedBuffer<{ $storage_size }> = AlignedBuffer::zeroed();
 
         get_pin_muts(($(
             $async_fun($($param),*)
